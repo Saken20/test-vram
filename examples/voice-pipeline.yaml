@@ -1,0 +1,100 @@
+# Voice assistant pipeline on one GPU: speech recognition -> chat LLM -> text-to-speech,
+# all behind OpenAI-compatible HTTP APIs served by public open-source servers.
+#
+#   asr  vLLM serving openai/whisper-large-v3      POST /v1/audio/transcriptions   (port 8001)
+#   llm  vLLM serving Qwen/Qwen2.5-3B-Instruct     POST /v1/chat/completions       (port 8000)
+#   tts  Kokoro-FastAPI (Kokoro-82M)               POST /v1/audio/speech           (port 8880)
+#
+# Example launch (two vLLM instances share the GPU, so split --gpu-memory-utilization between them):
+#   vllm serve openai/whisper-large-v3 --port 8001 --gpu-memory-utilization 0.20
+#   vllm serve Qwen/Qwen2.5-3B-Instruct --port 8000 --gpu-memory-utilization 0.50 --max-model-len 4096
+#   docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:latest
+#
+# Then:
+#   cp examples/voice-pipeline.yaml config.yaml
+#   python -m vramtest validate
+#   python -m vramtest gen-audio --service tts     # speak data/prompts.txt into data/audio/*.wav
+#   python -m vramtest probe
+#   python -m vramtest all
+#
+# A "session" is one user talking to the assistant: a few spoken turns with think time in between.
+
+gpu: {index: 0, sample_hz: 10, metrics_poll_s: 1.0}
+
+services:
+  asr:
+    adapter: openai
+    url: http://localhost:8001
+    kind: transcription                 # multipart upload of a WAV file, JSON {"text": ...} back
+    model: openai/whisper-large-v3
+    request: {language: en, temperature: 0}   # extra form fields
+    engine: vllm
+    # Whisper is an encoder-decoder model: KV bytes/token are computed for the decoder self-attention
+    # (2 x 32 layers x 20 heads x 64 head_dim x 2 bytes = 160 KiB). vLLM also caches cross-attention to the
+    # encoder output, which is not included, so treat ASR KV figures as approximate.
+    model_config: openai/whisper-large-v3
+    # weights_gib / kv_pool_tokens: copy from this instance's vLLM log for a more exact memory split
+    limits: {max_p95_latency_s: 3, max_p95_ttfb_s: 3}
+
+  llm:
+    adapter: openai
+    url: http://localhost:8000
+    kind: chat                          # streamed: TTFB = first token
+    model: Qwen/Qwen2.5-3B-Instruct
+    request: {max_tokens: 96, temperature: 0.7}
+    engine: vllm
+    model_config: Qwen/Qwen2.5-3B-Instruct    # HF repo id -> config.json -> KV bytes/token
+    max_model_len: 4096
+    prefix_caching: true                # the system prompt is shared by all sessions
+    limits: {max_p95_latency_s: 10, max_p95_ttfb_s: 1.5}
+
+  tts:
+    adapter: openai
+    url: http://localhost:8880
+    kind: speech                        # streamed audio body: TTFB = first audio chunk
+    model: kokoro
+    request: {voice: af_heart, response_format: pcm, stream: true}
+    audio_out: {format: pcm, sample_rate: 24000}   # raw 16-bit PCM -> audio seconds and real-time factor
+    engine: generic                     # not vLLM: its VRAM as measured by NVML is what it really uses
+    # Running in Docker? If `probe` finds no GPU process for port 8880, set pids or cmdline_match:
+    # cmdline_match: "uvicorn"
+    limits: {max_p95_latency_s: 10, max_p95_ttfb_s: 1}
+
+# One turn = the user's audio -> transcript -> answer -> speech.
+pipeline:
+  - {service: asr, input: audio}
+  - {service: llm, input: prev}         # the transcript becomes the last user message (system prompt + history kept)
+  - {service: tts, input: prev}         # the answer is spoken
+
+dataset:
+  texts: data/prompts.txt
+  audio_dir: data/audio                 # 16-bit PCM WAV clips (+ optional .txt transcripts); see `gen-audio`
+  audio_in: {format: f32le, sample_rate: 16000}   # sent to the transcription endpoint as a WAV file
+  system_prompt: "You are a friendly voice assistant. Answer in one or two short sentences."
+  history_turns: [0, 3]
+
+scenarios:
+  idle: {duration_s: 60}
+  burst: {levels: [1, 5, 10, 25, 50], rounds: 3, pause_s: 3}   # N users stop talking at the same instant
+  concurrency: {users: 10, duration_s: 120}
+  sessions:
+    turns_per_session: 4                # spoken turns in one session
+    session_duration_s: 60              # ... over one minute
+    duration_s: 300
+    profiles: {normal: 4, peak: 16}     # concurrent sessions
+  ramp:
+    levels: [1, 2, 4, 8, 16, 32, 64]
+    step_duration_s: 60
+    max_error_rate: 0.05
+    bisect_steps: 2
+    cooldown_s: 10
+
+capacity:
+  unit: session
+  safety_margin: 0.15
+  targets:
+    - {label: "1 session", sessions: 1}
+    - {label: "normal (4 sessions)", sessions: 4}
+    - {label: "peak (16 sessions)", sessions: 16}
+    - {label: "100 concurrent sessions", sessions: 100}
+    - {label: "250 concurrent sessions", sessions: 250}

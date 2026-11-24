@@ -1,0 +1,82 @@
+# One chat model served by vLLM's OpenAI-compatible server.
+#
+# Start the model (any GPU with enough memory for a 7B model in bf16), for example:
+#   vllm serve Qwen/Qwen2.5-7B-Instruct --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.90
+#
+# Then:
+#   cp examples/vllm-chat.yaml config.yaml
+#   python -m vramtest validate
+#   python -m vramtest probe
+#   python -m vramtest all
+#
+# Everything not set here falls back to the defaults (see README.md, "Configuration reference").
+
+gpu:
+  index: 0              # NVML index of the GPU the service runs on
+  sample_hz: 10         # VRAM samples per second
+  metrics_poll_s: 1.0   # how often vLLM /metrics is polled
+
+services:
+  llm:
+    adapter: openai
+    url: http://localhost:8000          # server root; a trailing /v1 is accepted too
+    kind: chat                          # POST /v1/chat/completions, streamed (TTFB = first token)
+    model: Qwen/Qwen2.5-7B-Instruct     # must match the served model name (empty = first id of /v1/models)
+    request:                            # merged into every request body
+      max_tokens: 256
+      temperature: 0.7
+
+    # --- memory model -------------------------------------------------------------------------
+    engine: vllm                        # KV-cache aware: separates model memory from the reserved KV pool
+    model_config: Qwen/Qwen2.5-7B-Instruct   # HF repo id, local config.json or model dir -> KV bytes/token
+    max_model_len: 8192                 # your --max-model-len: vLLM refuses to start with a smaller KV pool
+    prefix_caching: true                # the shared system prompt is held in the KV cache once
+    # metrics_url: http://localhost:8000/metrics   # auto-discovered from `url` when empty
+    # weights_gib: null                 # from the vLLM log line "Model loading took X GiB"
+    # kv_pool_tokens: null              # from the vLLM log line "GPU KV cache size: N tokens"
+    # kv_cache_dtype: fp8               # when vLLM runs with --kv-cache-dtype fp8
+    # tokenizer: Qwen/Qwen2.5-7B-Instruct   # exact token counts (needs `pip install transformers`)
+
+    # --- process discovery (only needed when `probe` does not find the GPU process) ---------
+    # pids: [12345]
+    # cmdline_match: "vllm serve"
+
+    timeout_s: 120
+    limits:                             # ramp: above these p95 values the service counts as saturated
+      max_p95_latency_s: 20             # full response
+      max_p95_ttfb_s: 3                 # time to first token
+
+# One turn = one chat request with the dataset's system prompt and a random chat history.
+pipeline:
+  - {service: llm, input: messages}
+
+dataset:
+  texts: data/prompts.txt               # one prompt per line ('#' = comment)
+  system_prompt: "You are a helpful assistant. Answer clearly and concisely."   # or a path to a text file
+  history_turns: [0, 2]                 # 0..2 previous user/assistant turns per request (grows the KV usage)
+  seed: 0
+
+scenarios:
+  idle: {duration_s: 60}
+  burst: {levels: [1, 10, 100], rounds: 3, pause_s: 3}
+  concurrency: {users: 10, duration_s: 120}
+  sessions:
+    turns_per_session: 3                # a user asks 3 questions ...
+    session_duration_s: 30              # ... spread over 30 seconds (think time in between)
+    duration_s: 180
+    profiles: {normal: 5, peak: 20}     # concurrent users
+  ramp:
+    levels: [1, 2, 5, 10, 20, 40, 80, 160]
+    step_duration_s: 60
+    max_error_rate: 0.05
+    bisect_steps: 2
+    cooldown_s: 5
+
+capacity:
+  unit: user
+  safety_margin: 0.10
+  targets:
+    - {label: "1 user", sessions: 1}
+    - {label: "normal (5 users)", sessions: 5}
+    - {label: "peak (20 users)", sessions: 20}
+    - {label: "1000 concurrent users", sessions: 1000}

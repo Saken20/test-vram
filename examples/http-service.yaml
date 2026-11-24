@@ -1,0 +1,90 @@
+# Custom JSON-over-HTTP services: any endpoint, request built from a template, answer read by a JSON path.
+#
+# This example loads Hugging Face Text Generation Inference (TGI) through its native /generate endpoint
+# and a Text Embeddings Inference (TEI) server through /embed:
+#   docker run --gpus all -p 8080:80 ghcr.io/huggingface/text-generation-inference:latest \
+#       --model-id Qwen/Qwen2.5-7B-Instruct
+#   docker run --gpus all -p 8081:80 ghcr.io/huggingface/text-embeddings-inference:latest \
+#       --model-id BAAI/bge-small-en-v1.5
+#
+# Then:
+#   cp examples/http-service.yaml config.yaml
+#   python -m vramtest validate
+#   python -m vramtest probe
+#   python -m vramtest all
+#
+# Both servers expose an OpenAI-compatible API as well (adapter: openai); the http adapter is for
+# endpoints that do not.
+
+gpu: {index: 0, sample_hz: 10, metrics_poll_s: 1.0}
+
+services:
+  generate:
+    adapter: http
+    url: http://localhost:8080/generate   # the full endpoint URL (placeholders allowed)
+    method: POST
+    json:                                 # request body template
+      inputs: "{text}"
+      parameters: {max_new_tokens: 128, temperature: 0.7, do_sample: true}
+    # headers: {Authorization: "Bearer <token>"}
+    stream: false                         # true: read the body in chunks, TTFB = first chunk
+    response:
+      text: generated_text                # dotted JSON path, e.g. "choices.0.text" or "output.text"
+      # ok: success                       # a falsy value marks the call as failed (code STATUS_FALSE)
+    engine: generic                       # the KV-aware model is for vLLM; here NVML VRAM is reported as is
+    # Docker hides the server process from /proc port lookup: if `probe` finds no GPU process,
+    # set its host PID or a substring of its command line.
+    # pids: [12345]
+    cmdline_match: text-generation-server   # the GPU process of TGI
+    timeout_s: 120
+    limits: {max_p95_latency_s: 20}      # not streamed: no TTFB is recorded
+
+  embed:
+    adapter: http
+    url: http://localhost:8081/embed
+    json: {inputs: "{text}"}
+    response: {}                          # only the timing matters; the vectors are not kept
+    cmdline_match: text-embeddings-router
+    limits: {max_p95_latency_s: 1, max_p95_ttfb_s: 1}
+
+  # Multipart upload (e.g. a whisper.cpp server: ./whisper-server --port 8090 -m <model>.bin).
+  # "{audio_wav}" is the turn's audio as a WAV file; a value that is bytes is sent as a file field.
+  # transcribe:
+  #   adapter: http
+  #   url: http://localhost:8090/inference
+  #   multipart: {file: "{audio_wav}", response_format: json, temperature: 0}
+  #   response: {text: text}
+  #
+  # Raw audio answer (e.g. a TTS endpoint returning audio bytes):
+  #   response: {audio: "$body"}             # or a base64 string field: {audio: "audio_base64"}
+  #   audio_out: {format: wav, sample_rate: 24000}
+
+# One turn = embed the user's question (e.g. for retrieval), then generate the answer from the same text.
+# Without a pipeline, burst/concurrency load each service separately (or pick one with --service NAME).
+pipeline:
+  - {service: embed, input: text}
+  - {service: generate, input: text}
+
+dataset:
+  texts: data/prompts.txt
+  history_turns: 0                        # plain prompts, no chat history
+
+scenarios:
+  idle: {duration_s: 60}
+  burst: {levels: [1, 10, 100], rounds: 3, pause_s: 3}
+  concurrency: {users: 10, duration_s: 120}
+  sessions:
+    turns_per_session: 3
+    session_duration_s: 30
+    duration_s: 180
+    profiles: {normal: 5, peak: 20}
+  ramp: {levels: [1, 2, 5, 10, 20, 40, 80, 160], step_duration_s: 60, max_error_rate: 0.05, bisect_steps: 2,
+         cooldown_s: 5}
+
+capacity:
+  unit: user
+  safety_margin: 0.10
+  targets:
+    - {label: "1 user", sessions: 1}
+    - {label: "peak (20 users)", sessions: 20}
+    - {label: "500 concurrent users", sessions: 500}

@@ -1,0 +1,11 @@
+grpcio>=1.60
+grpcio-tools>=1.60
+protobuf>=4.25
+nvidia-ml-py>=12.535
+numpy>=1.24
+scipy>=1.10
+PyYAML>=6.0
+reportlab>=4.0
+httpx>=0.25
+# optional, exact token counts: transformers
+# tests: pytest

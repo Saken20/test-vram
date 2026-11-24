@@ -1,0 +1,30 @@
+// Neutral demo service used by the examples and the test mocks.
+// Covers all four gRPC streaming shapes so any adapter setting can be tried against it.
+syntax = "proto3";
+
+package echo;
+
+message Meta {
+  string id = 1;
+  int32 session = 2;
+}
+
+message EchoRequest {
+  string text = 1;   // text input
+  bytes chunk = 2;   // audio chunk (client streaming)
+  Meta meta = 3;
+}
+
+message EchoReply {
+  string reply = 1;  // text output
+  bytes audio = 2;   // audio output (16-bit PCM)
+  bool ok = 3;
+  Meta meta = 4;
+}
+
+service Echo {
+  rpc Unary(EchoRequest) returns (EchoReply);
+  rpc ServerStream(EchoRequest) returns (stream EchoReply);
+  rpc ClientStream(stream EchoRequest) returns (EchoReply);
+  rpc BidiStream(stream EchoRequest) returns (stream EchoReply);
+}

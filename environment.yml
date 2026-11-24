@@ -1,0 +1,10 @@
+# conda env create -f environment.yml && conda activate vramtest
+name: vramtest
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.txt
+      - pytest

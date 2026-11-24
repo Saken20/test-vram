@@ -1,0 +1,100 @@
+# Custom gRPC services, described by a .proto file that is compiled at runtime (no generated code needed).
+#
+# This example uses examples/protos/echo.proto, which defines one service with all four streaming shapes:
+#   rpc Unary(EchoRequest)                returns (EchoReply);
+#   rpc ServerStream(EchoRequest)         returns (stream EchoReply);
+#   rpc ClientStream(stream EchoRequest)  returns (EchoReply);
+#   rpc BidiStream(stream EchoRequest)    returns (stream EchoReply);
+#
+# Try it without a GPU against the bundled mock server:
+#   python -m tests.mocks.grpc_mock 50051          # in another terminal
+#   python -m vramtest --config examples/grpc-service.yaml validate
+#   python -m vramtest --config examples/grpc-service.yaml probe
+#   python -m vramtest --config examples/grpc-service.yaml --quick burst
+#
+# For your own service: point `proto` at your .proto (plus `include_dirs` for its imports), set `method`
+# to "<package>.<Service>/<Method>" and map your message fields in `request` / `response`.
+
+gpu: {index: 0, sample_hz: 10, metrics_poll_s: 1.0}
+
+services:
+  # Unary text call: one request message, one reply.
+  echo_text:
+    adapter: grpc
+    address: localhost:50051
+    proto: examples/protos/echo.proto
+    method: echo.Echo/Unary
+    request:                            # rendered with placeholders, then parsed into EchoRequest
+      text: "{text}"
+      meta: {id: "{uuid}", session: "{session}"}   # "{session}" alone -> the integer itself
+    response:                           # dotted field paths in EchoReply
+      text: reply
+      audio: audio                      # bytes field -> audio seconds (see audio_out)
+      ok: ok                            # a false value marks the call as failed (code STATUS_FALSE)
+    audio_out: {format: s16le, sample_rate: 24000}
+    # metadata: {authorization: "Bearer <token>"}   # sent as gRPC metadata with every call
+    timeout_s: 60
+    limits: {max_p95_latency_s: 5, max_p95_ttfb_s: 1}
+
+  # Server streaming: text and audio are concatenated over all reply messages; TTFB = first message.
+  echo_stream:
+    adapter: grpc
+    address: localhost:50051
+    proto: examples/protos/echo.proto
+    method: echo.Echo/ServerStream
+    request: {text: "{text}", meta: {id: "{uuid}"}}
+    response: {text: reply, audio: audio}
+    audio_out: {format: s16le, sample_rate: 24000}
+    limits: {max_p95_latency_s: 10, max_p95_ttfb_s: 1}
+
+  # Client streaming audio: the turn's audio ({audio}, encoded as dataset.audio_in) is split into messages
+  # of `chunk_bytes`, each carrying the request template plus the chunk in field `chunk`. Processing time
+  # (latency) is measured from the moment the last chunk was sent.
+  echo_audio:
+    adapter: grpc
+    address: localhost:50051
+    proto: examples/protos/echo.proto
+    method: echo.Echo/ClientStream
+    request: {meta: {id: "{uuid}", session: "{session}"}}
+    stream_audio:
+      field: chunk                      # dotted path of the bytes field that receives each chunk
+      chunk_bytes: 16000                # 0.5 s of 16 kHz s16le audio per message
+      realtime: true                    # pace chunks at audio speed, like a live microphone
+    response: {text: reply, ok: ok}
+    limits: {max_p95_latency_s: 3, max_p95_ttfb_s: 3}
+
+  # A gRPC front-end in front of a vLLM engine can still use the KV-aware memory model:
+  #   engine: vllm
+  #   metrics_url: http://localhost:8000/metrics   # the engine's Prometheus endpoint
+  #   model_config: Qwen/Qwen2.5-7B-Instruct
+  #   cmdline_match: "vllm"                         # when the GPU process is not the one listening on the port
+
+# One turn: stream the user's audio in, then answer with a streamed reply built from the first reply's text.
+pipeline:
+  - {service: echo_audio, input: audio}
+  - {service: echo_stream, input: prev}
+
+dataset:
+  texts: data/prompts.txt
+  audio_dir: data/audio                 # no clips yet? `gen-audio --service echo_text` or add your own WAV files
+  audio_in: {format: s16le, sample_rate: 16000}   # how {audio} bytes are encoded for the services
+  history_turns: 0
+
+scenarios:
+  idle: {duration_s: 30}
+  burst: {levels: [1, 10, 50], rounds: 3, pause_s: 2}
+  concurrency: {users: 10, duration_s: 60}
+  sessions:
+    turns_per_session: 3
+    session_duration_s: 30
+    duration_s: 120
+    profiles: {normal: 4, peak: 16}
+  ramp: {levels: [1, 2, 5, 10, 20, 50, 100], step_duration_s: 30, max_error_rate: 0.05, bisect_steps: 2, cooldown_s: 3}
+
+capacity:
+  unit: session
+  safety_margin: 0.10
+  targets:
+    - {label: "1 session", sessions: 1}
+    - {label: "peak (16 sessions)", sessions: 16}
+    - {label: "200 sessions", sessions: 200}

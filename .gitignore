@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# generated code (protos compiled at runtime)
+vramtest/_gen/
+*_gen/
+
+# run results and local configuration
+results/
+/config.yaml
+
+# test audio (synthesized by `gen-audio` or your own recordings)
+data/audio/*
+!data/audio/.gitkeep
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
